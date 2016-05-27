@@ -20,8 +20,8 @@
 
 import time, os, errno, sys
 from urlgrabber.grabber import \
-    _readlines, URLGrabberOptions, _loads, \
-    PyCurlFileObject, URLGrabError
+    _readlines, URLGrabberOptions, _loads, _dumps, \
+    PyCurlFileObject, URLGrabError, getheaders
 
 def write(fmt, *arg):
     try: os.write(1, fmt % arg)
@@ -57,8 +57,13 @@ def main():
                 opts.progress_obj._id = cnt
 
             dlsz = dltm = 0
+            hdlist = []
             try:
                 fo = PyCurlFileObject(opts.url, opts.filename, opts)
+                if hasattr(opts, '_getheaders'):
+                    for name, commalist in opts._getheaders:
+                        values = getheaders(fo.hdr, name, commalist)
+                        hdlist.append(values)
                 fo._do_grab()
                 fo.fo.close()
                 size = fo._amount_read
@@ -69,7 +74,12 @@ def main():
             except URLGrabError, e:
                 size = 0
                 ug_err = '%d %d %s' % (e.errno, getattr(e, 'code', 0), e.strerror)
-            write('%d %d %d %.3f %s\n', opts._id, size, dlsz, dltm, ug_err)
+            if hasattr(opts, '_getheaders'):
+                headers = _dumps(hdlist) + ' '
+            else:
+                headers = ''
+            write('%d %d %d %.3f %s%s\n', opts._id, size, dlsz, dltm, headers,
+                  ug_err)
 
 if __name__ == '__main__':
     main()

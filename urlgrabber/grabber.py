@@ -647,6 +647,33 @@ def exception2msg(e):
         # always use byte strings
         return unicode(e).encode('utf8')
 
+def getheaders(msg, name, commalist=False):
+    """Return a list containing headers matching name in an rfc822.Message.
+
+    This differs from rfc822.Message.getallmatchingheaders() in that it
+        * can also parse comma-separated values (per RFC 2616) and it
+        * strips the header name and whitespace chars
+
+    To indicate that the field-value for this header is defined as a
+    comma-separated list and should be handled as such, set commalist to True.
+    """
+    lines = msg.getallmatchingheaders(name)
+    values = []
+    value = None
+    for line in lines:
+        if line.lower().startswith(name.lower()):
+            value = []
+            values.append(value)
+            line = line[len(name) + 1:]
+        if value is not None:
+            line = line.strip()
+            value.append(line)
+    values = [' '.join(value) for value in values]
+    if commalist:
+        splits = (value.split(',') for value in values)
+        values = [i.strip() for split in splits for i in split]
+    return values
+
 ########################################################################
 #                 END UTILITY FUNCTIONS
 ########################################################################
