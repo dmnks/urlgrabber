@@ -171,6 +171,12 @@ GENERAL ARGUMENTS (kwargs)
     The libproxy code is only used if the proxies dictionary
     does not provide any proxies.
 
+  no_cache = False
+
+    When True, server-side cache will be disabled for http and https
+    requests.  This is equivalent to setting
+      http_headers = (('Pragma', 'no-cache'),)
+
   prefix = None
 
     a url prefix that will be prepended to all requested urls.  For
@@ -430,6 +436,21 @@ RETRY RELATED ARGUMENTS
     This callback is very similar to failure_callback.  They are
     passed the same arguments, so you could use the same function for
     both.
+
+  retry_no_cache = False
+
+    When True, automatically enable no_cache for future retries if
+    urlgrabber detects that the served file comes from a proxy cache
+    rather than the origin.  This is done by inspecting the X-Cache http
+    header of the response that caused the failure.
+
+    This option is useful if you anticipate failures caused by outdated
+    files but don't want to enable no_cache straight away.  One example
+    would be a checkfunc validating the file against some other files
+    from the same server, which could produce a false negative if these
+    files are out-of-sync due to transparent proxy caching; enabling
+    this option would prevent that, while enjoying the benefits of
+    caching when applicable.
       
 BANDWIDTH THROTTLING
 
@@ -1028,6 +1049,8 @@ class URLGrabberOptions:
         self.half_life = 30*24*60*60 # 30 days
         self.default_speed = 500e3 # 500 kBps
         self.ftp_disable_epsv = False
+        self.no_cache = False
+        self.retry_no_cache = False
         
     def __repr__(self):
         return self.format()
@@ -1088,9 +1111,16 @@ class URLGrabber(object):
             if DEBUG: DEBUG.info('attempt %i/%s: %s',
                                  tries, opts.retry, args[0])
             try:
-                r = apply(func, (opts,) + args, {})
-                if DEBUG: DEBUG.info('success')
-                return r
+                hdr, err, ret = apply(func, (opts,) + args, {})
+                if err is None:
+                    if DEBUG: DEBUG.info('success')
+                    return ret
+                if opts.retry_no_cache and not opts.no_cache:
+                    for h in getheaders(hdr, 'X-Cache', True):
+                        if h.startswith('HIT'):
+                            opts.no_cache = True
+                            break
+                raise err
             except URLGrabError, e:
                 exception = e
                 callback = opts.failure_callback
@@ -1130,7 +1160,8 @@ class URLGrabber(object):
         (url,parts) = opts.urlparser.parse(url, opts) 
         opts.find_proxy(url, parts[0])
         def retryfunc(opts, url):
-            return PyCurlFileObject(url, filename=None, opts=opts)
+            fo = PyCurlFileObject(url, filename=None, opts=opts)
+            return fo.hdr, None, fo
         return self._retry(opts, retryfunc, url)
     
     def urlgrab(self, url, filename=None, opts=None, **kwargs):
@@ -1182,6 +1213,7 @@ class URLGrabber(object):
 
         def retryfunc(opts, url, filename):
             fo = PyCurlFileObject(url, filename, opts)
+            err = None
             try:
                 fo._do_grab()
                 if fo._tm_last:
@@ -1191,9 +1223,11 @@ class URLGrabber(object):
                 if not opts.checkfunc is None:
                     obj = CallbackObject(filename=filename, url=url)
                     _run_callback(opts.checkfunc, obj)
+            except URLGrabError, err:
+                pass
             finally:
                 fo.close()
-            return filename
+            return fo.hdr, err, filename
         
         try:
             return self._retry(opts, retryfunc, url, filename)
@@ -1219,6 +1253,7 @@ class URLGrabber(object):
             
         def retryfunc(opts, url, limit):
             fo = PyCurlFileObject(url, filename=None, opts=opts)
+            err = None
             s = ''
             try:
                 # this is an unfortunate thing.  Some file-like objects
@@ -1231,9 +1266,11 @@ class URLGrabber(object):
                 if not opts.checkfunc is None:
                     obj = CallbackObject(data=s, url=url)
                     _run_callback(opts.checkfunc, obj)
+            except URLGrabError, err:
+                pass
             finally:
                 fo.close()
-            return s
+            return fo.hdr, err, s
             
         s = self._retry(opts, retryfunc, url, limit)
         if limit and len(s) > limit:
@@ -1466,11 +1503,15 @@ class PyCurlFileObject(object):
                 self.curl_obj.setopt(pycurl.SSLKEYPASSWD, opts.ssl_key_pass)
 
         #headers:
-        if opts.http_headers and self.scheme in ('http', 'https'):
+        if self.scheme in ('http', 'https'):
             headers = []
-            for (tag, content) in opts.http_headers:
-                headers.append('%s:%s' % (tag, content))
-            self.curl_obj.setopt(pycurl.HTTPHEADER, headers)
+            if opts.http_headers is not None:
+                for (tag, content) in opts.http_headers:
+                    headers.append('%s:%s' % (tag, content))
+            if opts.no_cache:
+                headers.append('Pragma:no-cache')
+            if headers:
+                self.curl_obj.setopt(pycurl.HTTPHEADER, headers)
 
         # ranges:
         if opts.range or opts.reget:
@@ -2092,7 +2133,8 @@ class _ExternalDownloader:
         'ssl_key_pass',
         'ssl_verify_peer', 'ssl_verify_host',
         'size', 'max_header_size', 'ip_resolve',
-        'ftp_disable_epsv'
+        'ftp_disable_epsv',
+        'no_cache',
     )
 
     def start(self, opts):
@@ -2103,6 +2145,11 @@ class _ExternalDownloader:
             arg.append('%s=%s' % (k, _dumps(v)))
         if opts.progress_obj and opts.multi_progress_obj:
             arg.append('progress_obj=True')
+        if opts.retry_no_cache:
+            headers = [('X-Cache', True)]
+        else:
+            headers = []
+        arg.append('_getheaders=' + _dumps(headers))
         arg = ' '.join(arg)
         if DEBUG: DEBUG.info('attempt %i/%s: %s', opts.tries, opts.retry, opts.url)
 
@@ -2118,23 +2165,30 @@ class _ExternalDownloader:
             raise KeyboardInterrupt
         for line in lines:
             # parse downloader output
-            line = line.split(' ', 6)
+            line = line.split(' ', 7)
             _id, size = map(int, line[:2])
             if len(line) == 2:
                 self.running[_id]._progress.update(size)
                 continue
             # job done
             opts = self.running.pop(_id)
-            if line[4] == 'OK':
+            headers = _loads(line[4])
+            cached = False
+            if headers:
+                for h in headers[0]:
+                    if h.startswith('HIT'):
+                        cached = True
+                        break
+            if line[5] == 'OK':
                 ug_err = None
                 if DEBUG: DEBUG.info('success')
             else:
-                ug_err = URLGrabError(int(line[4]), line[6])
-                if line[5] != '0':
-                    ug_err.code = int(line[5])
+                ug_err = URLGrabError(int(line[5]), line[7])
+                if line[6] != '0':
+                    ug_err.code = int(line[6])
                 if DEBUG: DEBUG.info('failure: %s', ug_err)
             _TH.update(opts.url, int(line[2]), float(line[3]), ug_err, opts.async[0])
-            ret.append((opts, size, ug_err))
+            ret.append((opts, size, cached, ug_err))
         return ret
 
     def abort(self):
@@ -2233,7 +2287,7 @@ def parallel_wait(meter=None):
                 opts._progress = time.time() # no updates
 
     def perform():
-        for opts, size, ug_err in dl.perform():
+        for opts, size, cached, ug_err in dl.perform():
             key, limit = opts.async
             host_con[key] -= 1
 
@@ -2268,6 +2322,8 @@ def parallel_wait(meter=None):
                 reset_curl_obj()
 
             retry = opts.retry or 0
+            if opts.retry_no_cache and cached:
+                opts.no_cache = True
             if opts.failure_callback:
                 opts.exception = ug_err
                 try: _run_callback(opts.failure_callback, opts)
